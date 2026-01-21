@@ -6,19 +6,20 @@ import triton.language as tl
 _AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK": 512},  num_warps=4,  num_stages=2),
     triton.Config({"BLOCK": 1024}, num_warps=4,  num_stages=2),
-    triton.Config({"BLOCK": 1024}, num_warps=8,  num_stages=3),
     triton.Config({"BLOCK": 2048}, num_warps=4,  num_stages=3),
-    triton.Config({"BLOCK": 2048}, num_warps=8,  num_stages=4),
     triton.Config({"BLOCK": 4096}, num_warps=8,  num_stages=4),
-    triton.Config({"BLOCK": 4096}, num_warps=16, num_stages=5),
+    triton.Config({"BLOCK": 8192}, num_warps=8,  num_stages=4),
+    triton.Config({"BLOCK": 8192}, num_warps=16, num_stages=5),
 ]
 
+
 def _early_prune(configs, named_args, **kwargs):
-    # named_args contains runtime args like n_cols
     n_cols = int(named_args["n_cols"])
     pruned = [c for c in configs if int(c.kwargs["BLOCK"]) >= n_cols]
-    # Triton requires at least one config returned :contentReference[oaicite:1]{index=1}
-    return pruned if len(pruned) > 0 else [max(configs, key=lambda c: int(c.kwargs["BLOCK"]))]
+    if len(pruned) == 0:
+        raise ValueError(f"No valid BLOCK >= n_cols={n_cols}. Add larger BLOCK configs.")
+    return pruned
+
 
 
 @triton.autotune(

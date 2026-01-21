@@ -71,7 +71,9 @@ def main():
     plt.ylabel("Tuning overhead (ms)")
     plt.legend()
     plt.title("Cold-start tuning overhead vs shape")
-    plt.show()
+    plt.savefig("sweep_softmax_tuning_overhead.png")
+    # plt.show()
+    plt.close()
 
     # Plot steady-state
     plt.figure()
@@ -82,7 +84,9 @@ def main():
     plt.ylabel("Kernel time (us)")
     plt.legend()
     plt.title("Steady-state kernel latency")
-    plt.show()
+    plt.savefig("sweep_softmax_steady_state.png")
+    # plt.show()
+    plt.close()
 
 if __name__ == "__main__":
     main()

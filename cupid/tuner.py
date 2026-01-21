@@ -1,5 +1,6 @@
 # cupid/tuner.py
 from __future__ import annotations
+
 import json
 import random
 import torch
@@ -24,11 +25,13 @@ class TuneResult:
 
 class CUPIDTuner:
     """
-    CUPID-Tune:
-      - DejaVu-style on-disk cache
-      - Multi-fidelity evaluation
-      - Uncertainty-aware model (Bayesian linear regression)
-      - Adaptive candidate space rewrite (light-weight bottleneck heuristic)
+    CUPID-Tune (v2):
+      - Lazy compilation: no Stage-0 "compile everything"
+      - Multi-fidelity:
+          F1 = cheap CUDA-event timing (should be fast)
+          F2 = stable timing via triton.testing.do_bench
+      - Uncertainty-aware selection via Bayesian linear regression
+      - SQLite caching (DejaVu-style behavior)
     """
 
     def __init__(
@@ -52,7 +55,6 @@ class CUPIDTuner:
         bm, bn = shape_bucket_2d(m, n)
         dtype_str = str(dtype).replace("torch.", "")
         extra = extra_key or ""
-        # include device fingerprint for correctness
         return json.dumps(
             {
                 "kernel": self.kernel_name,
@@ -75,17 +77,29 @@ class CUPIDTuner:
         use_cache: bool = True,
     ) -> TuneResult:
         """
-        x: input tensor (we infer shape from it)
-        run_with_config(cfg) -> callable that runs kernel under cfg (no args)
+        x: input tensor (CUDA)
+        run_with_config(cfg) -> fn() that launches the kernel with cfg
+        kernel_family: e.g. "softmax", "vadd", etc.
 
-        budget_f1: how many cheap trials
-        budget_f2: how many expensive trials
+        budget_f1: number of *successful* cheap measurements
+        budget_f2: number of *successful* stable measurements
         """
-        assert x.is_cuda
-        m = int(x.shape[0])
-        n = int(x.shape[1]) if x.ndim == 2 else int(x.numel())
+
+        assert x.is_cuda, "x must be CUDA tensor"
+        assert x.ndim in (1, 2), "x must be 1D or 2D"
+
+        if x.ndim == 2:
+            m = int(x.shape[0])
+            n = int(x.shape[1])
+        else:
+            m = int(x.numel())
+            n = 1
+
         dtype = x.dtype
 
+        # -------------------------
+        # Cache check
+        # -------------------------
         cache_key = self._make_cache_key(m, n, dtype, extra_key)
         if use_cache:
             rec = self.db.get(cache_key)
@@ -98,113 +112,113 @@ class CUPIDTuner:
                     tried_f1=0,
                 )
 
+        # -------------------------
+        # Candidate generation (shape-aware)
+        # -------------------------
         gen = CandidateGenerator()
-        candidates = gen.generate(kernel_family, n_cols=n)
+        # IMPORTANT: pass n_cols so softmax can create BLOCK >= n
+        candidates = gen.generate(kernel_family, n_cols=n)  # <--- needs updated candidate_gen.py
         self.rng.shuffle(candidates)
 
-        # Model for uncertainty-aware selection
+        # -------------------------
+        # Surrogate model for UCB
+        # -------------------------
         model = BayesLinReg(dim=8, prior_var=50.0, noise_var=0.5)
 
-        # Track best
-        best_cfg = None
+        best_cfg: Optional[Dict[str, Any]] = None
         best_us = float("inf")
 
         tried_f1 = 0
         tried_f2 = 0
 
-        # --- Stage 0: F0 filter by compile feasibility
-        # feasible: List[Dict[str, Any]] = []
-        # for cfg in candidates:
-        #     try:
-        #         # A cheap feasibility test: attempt to build callable, no timing yet
-        #         fn = run_with_config(cfg)
-        #         # run 1 warm execution to trigger compile
-        #         fn()
-        #         feasible.append(cfg)
-        #     except Exception:
-        #         continue
+        # -------------------------
+        # Stage 1: F1 cheap timing (lazy compile)
+        # -------------------------
+        scored_f1: List[Tuple[float, Dict[str, Any]]] = []
 
-        # if len(feasible) == 0:
-        #     raise RuntimeError("No feasible configs compiled successfully.")
-
-        feasible = candidates  # skip feasibility for now
-
-        # --- Stage 1: F1 cheap timing
-        scored_f1 = []
-        for cfg in feasible:
+        for cfg in candidates:
             if tried_f1 >= budget_f1:
                 break
             try:
                 fn = run_with_config(cfg)
-                us = bench_us(fn, fidelity="F1")  # will compile if needed
+                us = bench_us(fn, fidelity="F1")  # should be quick
                 tried_f1 += 1
-                scored_f1.append((us, cfg))
 
+                scored_f1.append((us, cfg))
                 feat = featurize(m, n, dtype, cfg)
                 model.add(feat, us)
+
             except Exception:
+                # Compilation failure or runtime error => skip
                 continue
 
         if len(scored_f1) == 0:
-            raise RuntimeError("No configs succeeded in F1 benchmarking.")
+            raise RuntimeError("No configs succeeded during F1. Check candidate space / kernel constraints.")
 
-
+        model.fit()
         scored_f1.sort(key=lambda t: t[0])
 
-        # --- Stage 2: Pick F2 candidates via uncertainty-aware acquisition
-        # We take a mix: top cheap ones + UCB exploration
-        top_pool = [cfg for _, cfg in scored_f1[: min(10, len(scored_f1))]]
+        # -------------------------
+        # Stage 2: Select configs for F2 using:
+        #   - exploitation: top-k from F1
+        #   - exploration: UCB (mean - beta*std)
+        # -------------------------
+        top_k = min(10, len(scored_f1))
+        exploit_pool = [cfg for _, cfg in scored_f1[:top_k]]
 
-        # build extra candidates using UCB
-        ucb_pool = []
+        ucb_pool: List[Tuple[float, Dict[str, Any]]] = []
+        beta = 1.5  # exploration weight
         for _, cfg in scored_f1:
             feat = featurize(m, n, dtype, cfg)
             mean, std = model.predict(feat)
-            # lower latency is better => acquisition = mean - beta*std
-            beta = 1.5
+            # lower runtime is better
             score = mean - beta * std
             ucb_pool.append((score, cfg))
         ucb_pool.sort(key=lambda t: t[0])
-        ucb_pick = [cfg for _, cfg in ucb_pool[: min(10, len(ucb_pool))]]
+        explore_pool = [cfg for _, cfg in ucb_pool[:top_k]]
 
-        # merge unique while preserving order
-        f2_list = []
+        # Merge unique (keep order)
+        f2_list: List[Dict[str, Any]] = []
         seen = set()
-        for cfg in top_pool + ucb_pick:
+        for cfg in exploit_pool + explore_pool:
             k = json.dumps(cfg, sort_keys=True)
             if k not in seen:
                 seen.add(k)
                 f2_list.append(cfg)
 
-        # --- Adaptive rewrite checkpoint (lightweight heuristic)
-        # If F1 results are very close, we suspect memory-bound; widen blocks.
-        if len(scored_f1) >= 5:
-            ratio = scored_f1[0][0] / max(1e-6, scored_f1[4][0])
-            if ratio > 0.92:
-                gen.rewrite_space("memory_bound")
-            elif ratio < 0.70:
-                gen.rewrite_space("reg_bound")
+        # If still too few, fill with more from F1 ranking
+        for _, cfg in scored_f1:
+            if len(f2_list) >= max(budget_f2 * 2, 20):
+                break
+            k = json.dumps(cfg, sort_keys=True)
+            if k not in seen:
+                seen.add(k)
+                f2_list.append(cfg)
 
-        # Optionally expand a bit after rewrite
-        if tried_f2 < budget_f2:
-            extra = gen.generate(kernel_family)
-            self.rng.shuffle(extra)
-            for cfg in extra[:20]:
-                k = json.dumps(cfg, sort_keys=True)
-                if k not in seen:
-                    seen.add(k)
-                    f2_list.append(cfg)
+        # -------------------------
+        # Stage 3: F2 stable timing (THIS is the "similarly for F2" part)
+        # Wrap in try/except just like F1 so failures don't crash tuning.
+        # -------------------------
+        for cfg in f2_list:
+            if tried_f2 >= budget_f2:
+                break
+            try:
+                fn = run_with_config(cfg)
+                us = bench_us(fn, fidelity="F2")  # stable (do_bench-based)
 
-        # --- Stage 3: F2 stable timing (few)
-        for cfg in f2_list[:budget_f2]:
-            fn = run_with_config(cfg)
-            us = bench_us(fn, fidelity="F2")
-            tried_f2 += 1
-            if us < best_us:
-                best_us = us
-                best_cfg = cfg
+                tried_f2 += 1
+                if us < best_us:
+                    best_us = us
+                    best_cfg = cfg
 
-        assert best_cfg is not None
+            except Exception:
+                # Compilation failure or runtime error => skip
+                continue
+
+        if best_cfg is None:
+            raise RuntimeError("No configs succeeded during F2. Consider reducing constraints or increasing F1 pool.")
+
+        # Save to DB for warm-start
         self.db.put(cache_key, best_cfg, best_us)
 
         return TuneResult(
