@@ -1,1 +1,1 @@
-python experiments/run_softmax.py
+python -m experiments.run_softmax

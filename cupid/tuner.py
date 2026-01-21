@@ -99,7 +99,7 @@ class CUPIDTuner:
                 )
 
         gen = CandidateGenerator()
-        candidates = gen.generate(kernel_family)
+        candidates = gen.generate(kernel_family, n_cols=n)
         self.rng.shuffle(candidates)
 
         # Model for uncertainty-aware selection
@@ -113,32 +113,41 @@ class CUPIDTuner:
         tried_f2 = 0
 
         # --- Stage 0: F0 filter by compile feasibility
-        feasible: List[Dict[str, Any]] = []
-        for cfg in candidates:
+        # feasible: List[Dict[str, Any]] = []
+        # for cfg in candidates:
+        #     try:
+        #         # A cheap feasibility test: attempt to build callable, no timing yet
+        #         fn = run_with_config(cfg)
+        #         # run 1 warm execution to trigger compile
+        #         fn()
+        #         feasible.append(cfg)
+        #     except Exception:
+        #         continue
+
+        # if len(feasible) == 0:
+        #     raise RuntimeError("No feasible configs compiled successfully.")
+
+        feasible = candidates  # skip feasibility for now
+
+        # --- Stage 1: F1 cheap timing
+        scored_f1 = []
+        for cfg in feasible:
+            if tried_f1 >= budget_f1:
+                break
             try:
-                # A cheap feasibility test: attempt to build callable, no timing yet
                 fn = run_with_config(cfg)
-                # run 1 warm execution to trigger compile
-                fn()
-                feasible.append(cfg)
+                us = bench_us(fn, fidelity="F1")  # will compile if needed
+                tried_f1 += 1
+                scored_f1.append((us, cfg))
+
+                feat = featurize(m, n, dtype, cfg)
+                model.add(feat, us)
             except Exception:
                 continue
 
-        if len(feasible) == 0:
-            raise RuntimeError("No feasible configs compiled successfully.")
+        if len(scored_f1) == 0:
+            raise RuntimeError("No configs succeeded in F1 benchmarking.")
 
-        # --- Stage 1: F1 cheap scoring (many)
-        scored_f1: List[Tuple[float, Dict[str, Any]]] = []
-        for cfg in feasible[:budget_f1]:
-            fn = run_with_config(cfg)
-            us = bench_us(fn, fidelity="F1")
-            tried_f1 += 1
-            scored_f1.append((us, cfg))
-
-            # update model with noisy y
-            feat = featurize(m, n, dtype, cfg)
-            model.add(feat, us)
-        model.fit()
 
         scored_f1.sort(key=lambda t: t[0])
 

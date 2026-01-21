@@ -3,9 +3,6 @@ import torch
 import triton
 import triton.language as tl
 
-
-# Candidate configurations to benchmark.
-# Triton will try them when key=['n_cols'] changes. :contentReference[oaicite:1]{index=1}
 _AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK": 512},  num_warps=4,  num_stages=2),
     triton.Config({"BLOCK": 1024}, num_warps=4,  num_stages=2),
@@ -16,18 +13,26 @@ _AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK": 4096}, num_warps=16, num_stages=5),
 ]
 
+def _early_prune(configs, named_args, **kwargs):
+    # named_args contains runtime args like n_cols
+    n_cols = int(named_args["n_cols"])
+    pruned = [c for c in configs if int(c.kwargs["BLOCK"]) >= n_cols]
+    # Triton requires at least one config returned :contentReference[oaicite:1]{index=1}
+    return pruned if len(pruned) > 0 else [max(configs, key=lambda c: int(c.kwargs["BLOCK"]))]
+
 
 @triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
-    key=["n_cols"],  # retune when N changes :contentReference[oaicite:2]{index=2}
+    key=["n_cols"],
+    prune_configs_by={"early_config_prune": _early_prune},  # ✅ key fix :contentReference[oaicite:2]{index=2}
 )
 @triton.jit
 def softmax_row_kernel_autotuned(
     X_ptr, Y_ptr,
     stride_xm, stride_xn,
     stride_ym, stride_yn,
-    n_cols,                     # runtime key
-    BLOCK: tl.constexpr,        # chosen by autotune config
+    n_cols,                # runtime
+    BLOCK: tl.constexpr,   # autotuned
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -47,19 +52,13 @@ def softmax_row_kernel_autotuned(
 
 
 def softmax_triton_autotune(x: torch.Tensor) -> torch.Tensor:
-    """
-    Triton built-in autotune baseline.
-    First call triggers tuning for a given n_cols. :contentReference[oaicite:3]{index=3}
-    """
     assert x.is_cuda and x.ndim == 2
     M, N = x.shape
     y = torch.empty((M, N), device=x.device, dtype=torch.float16)
-
-    grid = (M,)
-    softmax_row_kernel_autotuned[grid](
+    softmax_row_kernel_autotuned[(M,)](
         x, y,
         x.stride(0), x.stride(1),
         y.stride(0), y.stride(1),
-        N,  # n_cols key
+        N,   # n_cols key
     )
     return y

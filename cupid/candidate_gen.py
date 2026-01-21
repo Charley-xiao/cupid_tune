@@ -2,6 +2,11 @@
 from __future__ import annotations
 from typing import Dict, Any, List
 import itertools
+import math 
+
+
+def next_pow2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
 
 
 class CandidateGenerator:
@@ -16,19 +21,24 @@ class CandidateGenerator:
         self.num_stages_list = [2, 3, 4, 5]
         self.block_list = [128, 256, 512, 1024, 2048]
 
-    def generate(self, kernel_family: str) -> List[Dict[str, Any]]:
-        """
-        kernel_family lets you tailor meta parameters
-        e.g., "vadd" uses BLOCK; softmax might use BLOCK_N etc.
-        """
+    def generate(self, kernel_family: str, n_cols: int | None = None):
+        # ✅ make softmax search space valid for all N
+        if kernel_family == "softmax" and n_cols is not None:
+            b = next_pow2(n_cols)
+            self.block_list = sorted(set([b, max(128, b // 2), min(8192, b * 2)]))
+            # keep it small like Triton autotune config list
+            self.num_warps_list = [2, 4, 8]
+            self.num_stages_list = [2, 3, 4]
+
         configs = []
-        for nw, ns, blk in itertools.product(self.num_warps_list, self.num_stages_list, self.block_list):
-            cfg = {
-                "num_warps": int(nw),
-                "num_stages": int(ns),
-                "meta": {"BLOCK": int(blk)},
-            }
-            configs.append(cfg)
+        for nw in self.num_warps_list:
+            for ns in self.num_stages_list:
+                for blk in self.block_list:
+                    configs.append({
+                        "num_warps": int(nw),
+                        "num_stages": int(ns),
+                        "meta": {"BLOCK": int(blk)},
+                    })
         return configs
 
     def rewrite_space(self, bottleneck: str):
